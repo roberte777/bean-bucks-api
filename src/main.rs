@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, env, net::SocketAddr};
+use std::{env, net::SocketAddr};
 
 use axum::{
     extract::State,
@@ -8,7 +8,7 @@ use axum::{
 };
 use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPoolOptions, MySql, Pool};
+use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
 
 #[derive(sqlx::FromRow, Debug, Serialize)]
 struct User {
@@ -21,8 +21,10 @@ struct User {
 struct Wager {
     id: i32,
     amount: i32,
+    closed: bool,
 }
 
+#[derive(sqlx::FromRow, Debug, Serialize)]
 struct UserWager {
     id: i32,
     wager_id: i32,
@@ -113,8 +115,139 @@ async fn create_user(
 * It should then give money to the winning users
 * Finally, it should mark the wager as closed
  */
-async fn close_wager() {
-    todo!()
+#[derive(Deserialize)]
+struct CloseWagerPayload {
+    wager_id: i32,
+    winning_user_discord_ids: Vec<u64>,
+    losing_user_discord_ids: Vec<u64>,
+}
+#[derive(Serialize)]
+struct SucessfullCloseWager {
+    winners: Vec<User>,
+    losers: Vec<User>,
+    wager: Wager,
+}
+
+async fn close_wager(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<CloseWagerPayload>,
+) -> (StatusCode, Json<SucessfullCloseWager>) {
+    // get the wager
+    let wager: Option<Wager> = sqlx::query_as::<_, Wager>("SELECT * FROM wager WHERE id = ?")
+        .bind(payload.wager_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("expected wager query to succeed");
+
+    if wager.is_none() {
+        return (
+            StatusCode::EXPECTATION_FAILED,
+            Json(SucessfullCloseWager {
+                winners: vec![],
+                losers: vec![],
+                wager: Wager {
+                    id: 0,
+                    amount: 0,
+                    closed: false,
+                },
+            }),
+        );
+    }
+
+    let wager = wager.unwrap();
+
+    if wager.closed {
+        return (
+            StatusCode::EXPECTATION_FAILED,
+            Json(SucessfullCloseWager {
+                winners: vec![],
+                losers: vec![],
+                wager,
+            }),
+        );
+    }
+
+    // get the users in the wager
+    let users_ids: Vec<u8> =
+        sqlx::query_as::<_, UserWager>("SELECT * FROM user_wager WHERE wager_id = ?")
+            .bind(payload.wager_id)
+            .fetch_all(&pool)
+            .await
+            .expect("expected user_wager query to succeed")
+            .into_iter()
+            .map(|user_wager| user_wager.user_id as u8)
+            .collect();
+
+    let users: Vec<User> = sqlx::query_as::<_, User>("SELECT * FROM user WHERE id IN (?)")
+        .bind(users_ids)
+        .fetch_all(&pool)
+        .await
+        .expect("expected user query to succeed");
+
+    // the users in the payload for winners and losers should be checked to make sure they were
+    // added to the wager. If they were not, they should be ignored
+    let mut winning_users: Vec<User> = vec![];
+    let mut losing_users: Vec<User> = vec![];
+    for user in users {
+        if payload.winning_user_discord_ids.contains(&user.discord_id) {
+            winning_users.push(User {
+                id: user.id,
+                discord_id: user.discord_id,
+                user_name: user.user_name,
+                bucks: user.bucks,
+            });
+        } else if payload.losing_user_discord_ids.contains(&user.discord_id) {
+            losing_users.push(User {
+                id: user.id,
+                discord_id: user.discord_id,
+                user_name: user.user_name,
+                bucks: user.bucks,
+            });
+        }
+    }
+
+    //payout the winners
+    let payout = wager.amount * (losing_users.len() as i32) / winning_users.len() as i32;
+    for user in &winning_users {
+        let new_bucks = user.bucks + payout;
+        sqlx::query("UPDATE user SET bucks = ? WHERE id = ?")
+            .bind(new_bucks)
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .expect("expected user update to succeed");
+    }
+
+    //take money from the losers
+    // if they do not have enough money, put them at zero
+    for user in &losing_users {
+        let mut new_bucks = user.bucks - wager.amount;
+        if new_bucks < 0 {
+            new_bucks = 0;
+        }
+        sqlx::query("UPDATE user SET bucks = ? WHERE id = ?")
+            .bind(new_bucks)
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .expect("expected user update to succeed");
+    }
+
+    //mark the wager as closed
+    sqlx::query("UPDATE wager SET closed = true WHERE id = ?")
+        .bind(payload.wager_id)
+        .execute(&pool)
+        .await
+        .expect("expected wager update to succeed");
+
+    (
+        StatusCode::OK,
+        Json(SucessfullCloseWager {
+            winners: winning_users,
+            losers: losing_users,
+            wager,
+        }),
+    )
 }
 
 async fn create_wager(
@@ -135,9 +268,35 @@ async fn create_wager(
         Json(Wager {
             id: wager_id as i32,
             amount: payload.amount,
+            closed: false,
         }),
     )
 }
-async fn add_user_to_wager() {
-    todo!()
+#[derive(Deserialize, Serialize)]
+struct UserForWagerPayload {
+    discord_id: u64,
+    wager_id: i32,
+}
+async fn add_user_to_wager(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<UserForWagerPayload>,
+) -> (StatusCode, Json<UserForWagerPayload>) {
+    // get the user id from the discord id
+    let user_id: i32 = sqlx::query("SELECT id from user where discord_id = ?")
+        .bind(payload.discord_id)
+        .fetch_one(&pool)
+        .await
+        .expect("expected user query to succeed")
+        .try_get("id")
+        .expect("expected user id to be an i32");
+
+    // insert the user into the wager
+    sqlx::query("INSERT INTO user_wager(user_id, wager_id) VALUES (?, ?)")
+        .bind(user_id)
+        .bind(payload.wager_id)
+        .execute(&pool)
+        .await
+        .expect("expected user_wager query to succeed");
+
+    return (StatusCode::OK, Json(payload));
 }
