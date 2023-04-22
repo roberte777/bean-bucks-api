@@ -17,6 +17,7 @@ struct User {
     user_name: String,
     bucks: i32,
 }
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize)]
 struct Wager {
     id: i32,
     amount: i32,
@@ -27,7 +28,6 @@ struct UserWager {
     wager_id: i32,
     user_id: i32,
 }
-// etc.
 
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
@@ -117,8 +117,26 @@ async fn close_wager() {
     todo!()
 }
 
-async fn create_wager() {
-    todo!()
+async fn create_wager(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<Wager>,
+) -> (StatusCode, Json<Wager>) {
+    // create a wager and return the id of the wager
+    let wager_id = sqlx::query("INSERT INTO wager(amount) VALUES (?)")
+        .bind(payload.amount)
+        .execute(&pool)
+        .await
+        .expect("excpect wager to successfull be created")
+        .last_insert_id();
+
+    // return the wager id
+    (
+        StatusCode::OK,
+        Json(Wager {
+            id: wager_id as i32,
+            amount: payload.amount,
+        }),
+    )
 }
 async fn add_user_to_wager() {
     todo!()
