@@ -342,7 +342,7 @@ async fn add_user_to_wager(
         .expect("expected user_wager query to succeed")
         .is_some()
     {
-        return (StatusCode::BAD_REQUEST, Json(payload));
+        return (StatusCode::OK, Json(payload));
     }
 
     //check if user has enough money to join wager
