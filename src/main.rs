@@ -379,11 +379,22 @@ async fn remove_user_from_wager(
     State(pool): State<Pool<MySql>>,
     Json(payload): Json<RemoveUserWagerPayload>,
 ) -> (StatusCode, Json<RemoveUserWagerPayload>) {
+    //get the user id given the discord id
+    let user_id: i32 = match sqlx::query("SELECT id from user where discord_id = ?")
+        .bind(payload.discord_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("expected user query to succeed")
+        .map(|row| row.try_get("id").expect("expected user id to be an i32"))
+    {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(payload)),
+    };
     //check if user is in the wager. If they are, remove them
     if let Some(user_wager) = sqlx::query_as::<_, UserWager>(
         "SELECT * FROM user_wager WHERE user_id = ? AND wager_id = ?",
     )
-    .bind(payload.discord_id)
+    .bind(user_id)
     .bind(payload.wager_id)
     .fetch_optional(&pool)
     .await
