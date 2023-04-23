@@ -1,7 +1,7 @@
 use std::{env, net::SocketAddr};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, patch, post},
     Json, Router,
@@ -43,7 +43,8 @@ async fn main() -> Result<(), sqlx::Error> {
     let app = Router::new()
         .route("/", get(root))
         .route("/users", get(list_users))
-        .route("/user", get(create_user))
+        .route("/user", get(get_user))
+        .route("/user", post(create_user))
         .route("/user/wager", post(add_user_to_wager))
         .route("/wager", post(create_wager))
         .route("/wager", patch(close_wager))
@@ -67,6 +68,32 @@ async fn list_users(State(pool): State<Pool<MySql>>) -> (StatusCode, Json<Vec<Us
         .await
         .expect("expected user query to success");
     (StatusCode::OK, Json(rows))
+}
+#[derive(Deserialize)]
+struct GetUserParams {
+    discord_id: u64,
+}
+async fn get_user(
+    State(pool): State<Pool<MySql>>,
+    user_params: Query<GetUserParams>,
+) -> (StatusCode, Json<User>) {
+    match sqlx::query_as::<_, User>("SELECT * FROM user where discord_id = ?")
+        .bind(user_params.discord_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("expected user query to succeed")
+    {
+        Some(user) => (StatusCode::OK, Json(user)),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(User {
+                id: 0,
+                discord_id: 0,
+                user_name: "".to_string(),
+                bucks: 0,
+            }),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -115,7 +142,7 @@ async fn create_user(
 * It should then give money to the winning users
 * Finally, it should mark the wager as closed
  */
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct CloseWagerPayload {
     wager_id: i32,
     winning_user_discord_ids: Vec<u64>,
@@ -168,7 +195,7 @@ async fn close_wager(
     }
 
     // get the users in the wager
-    let users_ids: Vec<u8> =
+    let user_ids: Vec<u8> =
         sqlx::query_as::<_, UserWager>("SELECT * FROM user_wager WHERE wager_id = ?")
             .bind(payload.wager_id)
             .fetch_all(&pool)
@@ -178,11 +205,15 @@ async fn close_wager(
             .map(|user_wager| user_wager.user_id as u8)
             .collect();
 
-    let users: Vec<User> = sqlx::query_as::<_, User>("SELECT * FROM user WHERE id IN (?)")
-        .bind(users_ids)
-        .fetch_all(&pool)
-        .await
-        .expect("expected user query to succeed");
+    let mut users: Vec<User> = vec![];
+    for user in &user_ids {
+        let user = sqlx::query_as::<_, User>("SELECT * FROM user WHERE id = ?")
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .expect("expected user query to succeed");
+        users.push(user);
+    }
 
     // the users in the payload for winners and losers should be checked to make sure they were
     // added to the wager. If they were not, they should be ignored
@@ -190,24 +221,18 @@ async fn close_wager(
     let mut losing_users: Vec<User> = vec![];
     for user in users {
         if payload.winning_user_discord_ids.contains(&user.discord_id) {
-            winning_users.push(User {
-                id: user.id,
-                discord_id: user.discord_id,
-                user_name: user.user_name,
-                bucks: user.bucks,
-            });
+            winning_users.push(user);
         } else if payload.losing_user_discord_ids.contains(&user.discord_id) {
-            losing_users.push(User {
-                id: user.id,
-                discord_id: user.discord_id,
-                user_name: user.user_name,
-                bucks: user.bucks,
-            });
+            losing_users.push(user);
         }
     }
 
     //payout the winners
-    let payout = wager.amount * (losing_users.len() as i32) / winning_users.len() as i32;
+    let mut payout = 0;
+    //print out winning users
+    if winning_users.len() > 0 {
+        payout = wager.amount * (losing_users.len() as i32) / winning_users.len() as i32;
+    }
     for user in &winning_users {
         let new_bucks = user.bucks + payout;
         sqlx::query("UPDATE user SET bucks = ? WHERE id = ?")
@@ -250,9 +275,14 @@ async fn close_wager(
     )
 }
 
+#[derive(Deserialize)]
+struct WagerInput {
+    amount: i32,
+}
+
 async fn create_wager(
     State(pool): State<Pool<MySql>>,
-    Json(payload): Json<Wager>,
+    Json(payload): Json<WagerInput>,
 ) -> (StatusCode, Json<Wager>) {
     // create a wager and return the id of the wager
     let wager_id = sqlx::query("INSERT INTO wager(amount) VALUES (?)")
@@ -275,6 +305,7 @@ async fn create_wager(
 #[derive(Deserialize, Serialize)]
 struct UserForWagerPayload {
     discord_id: u64,
+    user_name: String,
     wager_id: i32,
 }
 async fn add_user_to_wager(
@@ -282,13 +313,51 @@ async fn add_user_to_wager(
     Json(payload): Json<UserForWagerPayload>,
 ) -> (StatusCode, Json<UserForWagerPayload>) {
     // get the user id from the discord id
-    let user_id: i32 = sqlx::query("SELECT id from user where discord_id = ?")
+    // if the user does not exist, create them with an amount of 500
+    let user_id: i32 = match sqlx::query("SELECT id from user where discord_id = ?")
         .bind(payload.discord_id)
-        .fetch_one(&pool)
+        .fetch_optional(&pool)
         .await
         .expect("expected user query to succeed")
-        .try_get("id")
-        .expect("expected user id to be an i32");
+        .map(|row| row.try_get("id").expect("expected user id to be an i32"))
+    {
+        Some(id) => id,
+        None => sqlx::query("INSERT INTO user(discord_id, user_name, bucks) VALUES (?, ?, ?)")
+            .bind(payload.discord_id)
+            .bind(&payload.user_name)
+            .bind(500)
+            .execute(&pool)
+            .await
+            .expect("expected user insert to succeed")
+            .last_insert_id() as i32,
+    };
+
+    //check if user is already in the wager
+    if sqlx::query("SELECT * FROM user_wager WHERE user_id = ? AND wager_id = ?")
+        .bind(user_id)
+        .bind(payload.wager_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("expected user_wager query to succeed")
+        .is_some()
+    {
+        return (StatusCode::BAD_REQUEST, Json(payload));
+    }
+
+    //check if user has enough money to join wager
+    let user = sqlx::query_as::<_, User>("SELECT * FROM user WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("expected user query to succeed");
+    let wager = sqlx::query_as::<_, Wager>("SELECT * FROM wager WHERE id = ?")
+        .bind(payload.wager_id)
+        .fetch_one(&pool)
+        .await
+        .expect("expected wager query to succeed");
+    if user.bucks < wager.amount {
+        return (StatusCode::BAD_REQUEST, Json(payload));
+    }
 
     // insert the user into the wager
     sqlx::query("INSERT INTO user_wager(user_id, wager_id) VALUES (?, ?)")
