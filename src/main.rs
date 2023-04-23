@@ -3,7 +3,7 @@ use std::{env, net::SocketAddr};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use dotenv::dotenv;
@@ -46,6 +46,7 @@ async fn main() -> Result<(), sqlx::Error> {
         .route("/user", get(get_user))
         .route("/user", post(create_user))
         .route("/user/wager", post(add_user_to_wager))
+        .route("/user/wager", delete(remove_user_from_wager))
         .route("/wager", post(create_wager))
         .route("/wager", patch(close_wager))
         .with_state(pool);
@@ -368,4 +369,33 @@ async fn add_user_to_wager(
         .expect("expected user_wager query to succeed");
 
     return (StatusCode::OK, Json(payload));
+}
+#[derive(Deserialize, Serialize)]
+struct RemoveUserWagerPayload {
+    discord_id: u64,
+    wager_id: i32,
+}
+async fn remove_user_from_wager(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<RemoveUserWagerPayload>,
+) -> (StatusCode, Json<RemoveUserWagerPayload>) {
+    //check if user is in the wager. If they are, remove them
+    if let Some(user_wager) = sqlx::query_as::<_, UserWager>(
+        "SELECT * FROM user_wager WHERE user_id = ? AND wager_id = ?",
+    )
+    .bind(payload.discord_id)
+    .bind(payload.wager_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("expected user_wager query to succeed")
+    {
+        sqlx::query("DELETE FROM user_wager WHERE id = ?")
+            .bind(user_wager.id)
+            .execute(&pool)
+            .await
+            .expect("expected user_wager delete to succeed");
+        return (StatusCode::OK, Json(payload));
+    } else {
+        return (StatusCode::BAD_REQUEST, Json(payload));
+    }
 }
